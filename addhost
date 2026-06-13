@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# addhost - manage /etc/hosts for HTB / pentest targets
+
+set -eo pipefail
+
+HOSTS_FILE="/etc/hosts"
+BOLD="\e[1m"
+RED="\e[31m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+CYAN="\e[36m"
+RESET="\e[0m"
+
+usage() {
+    echo -e "${BOLD}addhost${RESET} — /etc/hosts manager for pentest targets"
+    echo ""
+    echo -e "  ${CYAN}addhost add${RESET}  <ip> <hostname> [hostname2 ...]   Add an entry"
+    echo -e "  ${CYAN}addhost rm${RESET}   <ip|hostname>                     Remove matching entries"
+    echo -e "  ${CYAN}addhost auto${RESET} <ip>                              Detect hostname & add"
+    echo -e "  ${CYAN}addhost list${RESET}                                   List non-default entries"
+    echo ""
+}
+
+err() {
+    echo -e "${RED}[!]${RESET} $1"
+    [ -n "${2:-}" ] && echo -e "    ${CYAN}Fix:${RESET} $2"
+}
+
+check_sudo() {
+    if ! sudo -n true 2>/dev/null; then
+        echo -e "${YELLOW}[sudo]${RESET} password required to edit $HOSTS_FILE"
+    fi
+    if ! sudo true; then
+        err "sudo failed — cannot edit $HOSTS_FILE" "Run as a user with sudo access"
+        exit 1
+    fi
+}
+
+validate_ip() {
+    echo "${1:-}" | grep -qP '^\d{1,3}(\.\d{1,3}){3}$'
+}
+
+validate_hostname() {
+    echo "${1:-}" | grep -qP '^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$'
+}
+
+cmd_add() {
+    local ip="${1:-}"
+    shift 2>/dev/null || true
+    local hosts="${*:-}"
+
+    if [ -z "$ip" ]; then
+        err "Missing IP address" "addhost add <ip> <hostname>"
+        exit 1
+    fi
+    if ! validate_ip "$ip"; then
+        err "Invalid IP address: $ip" "Provide a valid IPv4 address, e.g. 10.129.12.68"
+        exit 1
+    fi
+    if [ -z "$hosts" ]; then
+        err "Missing hostname" "addhost add $ip <hostname>"
+        exit 1
+    fi
+
+    check_sudo
+    sudo sed -i "/^${ip}[[:space:]]/d" "$HOSTS_FILE"
+    echo "$ip $hosts" | sudo tee -a "$HOSTS_FILE" > /dev/null
+    echo -e "${GREEN}[+]${RESET} Added: ${BOLD}$ip${RESET} -> ${BOLD}$hosts${RESET}"
+}
+
+cmd_rm() {
+    local term="${1:-}"
+
+    if [ -z "$term" ]; then
+        err "Missing argument" "addhost rm <ip|hostname>"
+        exit 1
+    fi
+
+    check_sudo
+    local escaped
+    escaped=$(printf '%s\n' "$term" | sed 's/[[\.*^$()+?{|]/\\&/g')
+    local count
+    count=$(grep -cP "(^|\s)${escaped}(\s|$)" "$HOSTS_FILE" || true)
+
+    if [ "$count" -eq 0 ]; then
+        echo -e "${YELLOW}[-]${RESET} No entries found matching: $term"
+        return
+    fi
+
+    sudo sed -i "/${escaped}/d" "$HOSTS_FILE"
+    echo -e "${RED}[-]${RESET} Removed $count line(s) matching: ${BOLD}$term${RESET}"
+}
+
+cmd_auto() {
+    local ip="${1:-}"
+
+    if [ -z "$ip" ]; then
+        err "Missing IP address" "addhost auto <ip>"
+        exit 1
+    fi
+    if ! validate_ip "$ip"; then
+        err "Invalid IP address: $ip" "Provide a valid IPv4 address, e.g. 10.129.12.68"
+        exit 1
+    fi
+
+    echo -e "${CYAN}[*]${RESET} Probing $ip ..."
+    local hostname=""
+
+    # 1. HTTP redirect Location header
+    hostname=$(curl -sI --max-time 5 "http://$ip" 2>/dev/null \
+        | grep -i "^location:" \
+        | sed -E 's|[Ll]ocation:.*://([^/:]+).*|\1|' \
+        | tr -d '\r' || true)
+
+    # 2. HTTPS redirect Location header
+    if [ -z "$hostname" ]; then
+        hostname=$(curl -sIk --max-time 5 "https://$ip" 2>/dev/null \
+            | grep -i "^location:" \
+            | sed -E 's|[Ll]ocation:.*://([^/:]+).*|\1|' \
+            | tr -d '\r' || true)
+    fi
+
+    # 3. SSL certificate CN / SAN
+    if [ -z "$hostname" ]; then
+        hostname=$(echo | timeout 5 openssl s_client -connect "$ip:443" 2>/dev/null \
+            | openssl x509 -noout -subject -ext subjectAltName 2>/dev/null \
+            | grep -oP '(?<=CN\s=\s)[^\s,]+|(?<=DNS:)[^,\s]+' \
+            | head -1 || true)
+    fi
+
+    # 4. HTML body href/src links pointing to a non-IP hostname
+    if [ -z "$hostname" ]; then
+        hostname=$(curl -s --max-time 5 "http://$ip" 2>/dev/null \
+            | grep -oP '(?<=href="|src="|action="|url=")https?://\K[^/"]+' \
+            | grep -v "^$ip$" \
+            | head -1 || true)
+    fi
+
+    if [ -z "$hostname" ]; then
+        err "Could not detect hostname automatically from $ip" \
+            "addhost add $ip <hostname>"
+        exit 1
+    fi
+
+    if ! validate_hostname "$hostname"; then
+        err "Detected hostname looks suspicious, aborting: $hostname" \
+            "addhost add $ip <hostname>  # add it manually if you trust it"
+        exit 1
+    fi
+
+    echo -e "${GREEN}[+]${RESET} Detected hostname: ${BOLD}$hostname${RESET}"
+    cmd_add "$ip" "$hostname"
+}
+
+cmd_list() {
+    echo -e "${BOLD}${CYAN}── /etc/hosts (non-default entries) ──${RESET}"
+    local entries
+    entries=$(grep -vP "^(#|127\.|::1|fe80|ff0|0\.0\.0\.0|\s*$)" "$HOSTS_FILE" || true)
+    if [ -z "$entries" ]; then
+        echo "  (none)"
+    else
+        echo "$entries" | awk '{printf "  %-20s %s\n", $1, substr($0, index($0,$2))}'
+    fi
+}
+
+# ── entrypoint ─────────────────────────────────────────────────────────────────
+
+CMD="${1:-}"
+
+case "$CMD" in
+    add)             shift; cmd_add "$@" ;;
+    rm|clear|remove) shift; cmd_rm "${1:-}" ;;
+    auto)            shift; cmd_auto "${1:-}" ;;
+    list)            cmd_list ;;
+    -h|--help|help|"")  usage ;;
+    *)
+        err "Unknown command: $CMD" "Run 'addhost --help' to see available commands"
+        exit 1
+        ;;
+esac
