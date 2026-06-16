@@ -14,9 +14,11 @@ RESET="\e[0m"
 usage() {
     echo -e "${BOLD}addhost${RESET} — /etc/hosts manager for pentest targets"
     echo ""
-    echo -e "  ${CYAN}addhost add${RESET}  <ip> <hostname> [hostname2 ...]   Add an entry"
+    echo -e "  ${CYAN}addhost${RESET} <ip>                                   Auto-detect hostname & add"
+    echo -e "  ${CYAN}addhost${RESET} <ip> <hostname> [hostname2 ...]        Add an entry"
+    echo -e "  ${CYAN}addhost add${RESET}  <ip> <hostname> [hostname2 ...]   Add an entry (explicit)"
     echo -e "  ${CYAN}addhost rm${RESET}   <ip|hostname>                     Remove matching entries"
-    echo -e "  ${CYAN}addhost auto${RESET} <ip>                              Detect hostname & add"
+    echo -e "  ${CYAN}addhost auto${RESET} <ip>                              Detect hostname & add (explicit)"
     echo -e "  ${CYAN}addhost list${RESET}                                   List non-default entries"
     echo ""
 }
@@ -63,7 +65,15 @@ cmd_add() {
     fi
 
     check_sudo
+    # Remove any existing line for this IP
     sudo sed -i "/^${ip}[[:space:]]/d" "$HOSTS_FILE"
+    # Remove any existing lines containing any of these hostnames (so an old
+    # IP mapped to the same vhost is dropped in favour of the new one)
+    local h esc
+    for h in $hosts; do
+        esc=$(printf '%s\n' "$h" | sed 's/[[\.*^$()+?{|/]/\\&/g')
+        sudo sed -i "/[[:space:]]${esc}\([[:space:]]\|\$\)/d" "$HOSTS_FILE"
+    done
     echo "$ip $hosts" | sudo tee -a "$HOSTS_FILE" > /dev/null
     echo -e "${GREEN}[+]${RESET} Added: ${BOLD}$ip${RESET} -> ${BOLD}$hosts${RESET}"
 }
@@ -174,7 +184,18 @@ case "$CMD" in
     list)            cmd_list ;;
     -h|--help|help|"")  usage ;;
     *)
-        err "Unknown command: $CMD" "Run 'addhost --help' to see available commands"
-        exit 1
+        # Shorthand: if the first arg is an IP, infer the command.
+        #   addhost <ip>            -> auto-detect the hostname
+        #   addhost <ip> <host...>  -> add directly
+        if validate_ip "$CMD"; then
+            if [ "$#" -ge 2 ]; then
+                cmd_add "$@"
+            else
+                cmd_auto "$CMD"
+            fi
+        else
+            err "Unknown command: $CMD" "Run 'addhost --help' to see available commands"
+            exit 1
+        fi
         ;;
 esac
